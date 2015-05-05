@@ -20,6 +20,8 @@ module VagrantPlugins
           mess = 'vagrant_libvirt::action::create_networks'
           @logger = Log4r::Logger.new(mess)
           @app = app
+          env[:interface_mapping] ||= {}
+          @mapped_file = mapped_networks_file(env)
 
           @available_networks = []
           @options = {}
@@ -36,6 +38,10 @@ module VagrantPlugins
             configured_networks(env, @logger).each do |options|
               # Only need to create private networks
               next if options[:iface_type] != :private_network
+
+              env[:interface_mapping].merge!(Marshal.load(IO.read(@mapped_file))) if
+                File.exist?(@mapped_file)
+
               @logger.debug "Searching for network with options #{options}"
 
               # should fix other methods so this doesn't have to be instance var
@@ -59,7 +65,7 @@ module VagrantPlugins
                 libvirt_network:  nil,
               }
 
-              if @options[:ip]
+              if @options[:ip] || @options[:forward_mode] == 'veryisolated'
                 handle_ip_option(env)
               # in vagrant 1.2.3 and later it is not possible to take this branch
               # because cannot have name without ip
@@ -113,54 +119,54 @@ module VagrantPlugins
         # Handle only situations, when ip is specified. Variables @options and
         # @available_networks should be filled before calling this function.
         def handle_ip_option(env)
-          return if !@options[:ip]
-
-          net_address = network_address(@options[:ip], @options[:netmask])
-          @interface_network[:network_address] = net_address
-
-          # Set IP address of network (actually bridge). It will be used as
-          # gateway address for machines connected to this network.
-          net = IPAddr.new(net_address)
-          @interface_network[:ip_address] = net.to_range.begin.succ
-
-          # Is there an available network matching to configured ip
-          # address?
-          @available_networks.each do |available_network|
-            if available_network[:network_address] == \
-            @interface_network[:network_address]
-              @interface_network = available_network
-              @logger.debug "found existing network by ip, values are"
-              @logger.debug @interface_network
-              break
+          return if !@options[:ip] && !@options[:forward_mode] == 'veryisolated'
+          if @options[:forward_mode] == 'veryisolated'
+            # check if the veryisolated has already been created
+            mapped_name = env[:interface_mapping][@options[:network_name]]
+            if !mapped_name.nil?
+              find_if_network_available_by(:name, mapped_name)
             end
-          end
+          else
+            net_address = network_address(@options[:ip], @options[:netmask])
+            @interface_network[:network_address] = net_address
 
-          if @interface_network[:created]
-            verify_dhcp
-          end
+            # Set IP address of network (actually bridge). It will be used as
+            # gateway address for machines connected to this network.
+            net = IPAddr.new(net_address)
+            @interface_network[:ip_address] = net.to_range.begin.succ
 
-          if @options[:network_name]
-            @logger.debug "Checking that network name does not clash with ip"
+            # Is there an available network matching to configured ip
+            # address?
+            find_if_network_available_by(:network_address,
+              @interface_network[:network_address])
+
             if @interface_network[:created]
-              # Just check for mismatch error here - if name and ip from
-              # config match together.
-              if @options[:network_name] != @interface_network[:name]
-                raise Errors::NetworkNameAndAddressMismatch,
-                      ip_address:   @options[:ip],
-                      network_name: @options[:network_name]
-              end
-            else
-              # Network is not created, but name is set. We need to check,
-              # whether network name from config doesn't already exist.
-              if lookup_network_by_name @options[:network_name]
-                raise Errors::NetworkNameAndAddressMismatch,
-                      ip_address:   @options[:ip],
-                      network_name: @options[:network_name]
-              end
+              verify_dhcp
+            end
 
-              # Network with 'name' doesn't exist. Set it as name for new
-              # network.
-              @interface_network[:name] = @options[:network_name]
+            if @options[:network_name]
+              @logger.debug "Checking that network name does not clash with ip"
+              if @interface_network[:created]
+                # Just check for mismatch error here - if name and ip from
+                # config match together.
+                if @options[:network_name] != @interface_network[:name]
+                  raise Errors::NetworkNameAndAddressMismatch,
+                    ip_address:   @options[:ip],
+                    network_name: @options[:network_name]
+                end
+              else
+                # Network is not created, but name is set. We need to check,
+                # whether network name from config doesn't already exist.
+                if lookup_network_by_name @options[:network_name]
+                  raise Errors::NetworkNameAndAddressMismatch,
+                    ip_address:   @options[:ip],
+                    network_name: @options[:network_name]
+                end
+
+                # Network with 'name' doesn't exist. Set it as name for new
+                # network.
+                @interface_network[:name] = @options[:network_name]
+              end
             end
           end
 
@@ -175,8 +181,12 @@ module VagrantPlugins
               @logger.debug "generating name for network"
 
               # Generate a network name.
-              network_name = env[:root_path].basename.to_s.dup
-              network_name << count.to_s
+              if @options[:forward_mode] == 'veryisolated'
+                network_name = @options[:network_name]
+              else
+                network_name = env[:root_path].basename.to_s.dup
+              end
+              network_name = "#{network_name}#{count}"
               count += 1
 
               # Check if network name is unique.
@@ -184,13 +194,15 @@ module VagrantPlugins
 
               @interface_network[:name] = network_name
             end
+            env[:interface_mapping].merge!(
+              {@options[:network_name] => @interface_network[:name]})
 
             # Generate a unique name for network bridge.
             count = 0
             while @interface_network[:bridge_name].nil?
               @logger.debug "generating name for bridge"
               bridge_name = 'virbr'
-              bridge_name << count.to_s
+              bridge_name = "#{bridge_name}#{count.to_s}"
               count += 1
 
               next if lookup_bridge_by_name(bridge_name)
@@ -272,6 +284,7 @@ module VagrantPlugins
           File.open(created_networks_file, 'a') do |file|
             file.puts @interface_network[:libvirt_network].uuid
           end
+          File.write(@mapped_file, Marshal.dump(env[:interface_mapping]))
         end
 
         def autostart_network
@@ -290,6 +303,19 @@ module VagrantPlugins
           end
         end
 
+        def find_if_network_available_by(key, value)
+          @available_networks.each do |available_network|
+            if available_network[key] == value
+              @interface_network = available_network
+              @logger.debug "found existing network by ip, values are"
+              @logger.debug @interface_network
+              break
+            end
+          end
+        end
+        def mapped_networks_file(env)
+          File.join(env[:machine].data_dir, '..', '..', 'mapped_networks')
+        end
       end
     end
   end

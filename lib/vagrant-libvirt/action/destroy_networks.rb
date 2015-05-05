@@ -17,6 +17,7 @@ module VagrantPlugins
           # If there were some networks created for this machine, in machines
           # data directory, created_networks file holds UUIDs of each network.
           created_networks_file = env[:machine].data_dir + 'created_networks'
+          mapped_network_file = File.join(env[:machine].data_dir, '..', '..', 'mapped_networks')
 
           @logger.info 'Checking if any networks were created'
           # If created_networks file doesn't exist, there are no networks we
@@ -85,6 +86,9 @@ module VagrantPlugins
           else
             @logger.info "Deleting created_networks file"
             File.delete(created_networks_file)
+          end
+          if File.exist?(mapped_network_file)
+            File.delete(mapped_network_file)
           end
 
           env[:machine].id = nil

@@ -66,7 +66,9 @@ module VagrantPlugins
           # Create each interface as new domain device.
           adapters.each_with_index do |iface_configuration, slot_number|
             @iface_number = slot_number
-            @network_name = iface_configuration[:network_name]
+            mapped_name = env[:interface_mapping][iface_configuration[:network_name]]
+            @network_name = !mapped_name.nil? ? mapped_name : iface_configuration[:network_name]
+
             @mac = iface_configuration.fetch(:mac, false)
             @model_type = iface_configuration.fetch(:model_type, @nic_model_type)
             template_name = 'interface'
